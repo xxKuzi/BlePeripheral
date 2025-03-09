@@ -1,11 +1,10 @@
 use std::io::{self, BufRead};
-use tokio::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-
-
-static STATE: AtomicBool = AtomicBool::new(false);
 
 use ble_peripheral_rust::{
     gatt::{
@@ -21,6 +20,8 @@ use ble_peripheral_rust::{
     Peripheral, PeripheralImpl,
 };
 
+static STATE: AtomicBool = AtomicBool::new(false);
+
 #[tokio::main]
 async fn main() {
     std::env::set_var("RUST_LOG", "info");
@@ -33,7 +34,7 @@ async fn main() {
 async fn start_app() {
     let char_uuid = Uuid::from_short(0x2A3D_u16);
 
-    // Define Service With Characteristics
+    // Define a service with characteristics.
     let service = Service {
         uuid: Uuid::from_short(0x1234_u16),
         primary: true,
@@ -65,40 +66,58 @@ async fn start_app() {
 
     let (sender_tx, mut receiver_rx) = mpsc::channel::<PeripheralEvent>(256);
 
-    let mut peripheral = Peripheral::new(sender_tx).await.unwrap();
+    // Create the peripheral and wrap it in an Arc with a Mutex.
+    let peripheral = Arc::new(Mutex::new(
+        Peripheral::new(sender_tx).await.unwrap(),
+    ));
 
-    // Handle Updates
+    // Clone the peripheral and char_uuid for the event handler.
+    let peripheral_for_events = peripheral.clone();
+    let char_uuid_for_events = char_uuid.clone();
     tokio::spawn(async move {
         while let Some(event) = receiver_rx.recv().await {
-            handle_updates(event);
+            handle_updates(event, peripheral_for_events.clone(), char_uuid_for_events).await;
         }
     });
 
-    while !peripheral.is_powered().await.unwrap() {}
+    // Wait until the peripheral is powered on.
+    loop {
+        let powered = {
+            let mut periph = peripheral.lock().await;
+            periph.is_powered().await.unwrap_or(false)
+        };
+        if powered {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
-    if let Err(err) = peripheral.add_service(&service).await {
-        log::error!("Error adding service: {}", err);
-        return;
+    // Add the service.
+    {
+        let mut periph = peripheral.lock().await;
+        if let Err(err) = periph.add_service(&service).await {
+            log::error!("Error adding service: {}", err);
+            return;
+        }
     }
     log::info!("Service Added");
 
-    if let Err(err) = peripheral
-        .start_advertising("RustBLE", &[service.uuid])
-        .await
+    // Start advertising.
     {
-        log::error!("Error starting advertising: {}", err);
-        return;
+        let mut periph = peripheral.lock().await;
+        if let Err(err) = periph.start_advertising("RustBLE", &[service.uuid]).await {
+            log::error!("Error starting advertising: {}", err);
+            return;
+        }
     }
     log::info!("Advertising Started");
 
-    // Write in console to send to characteristic update to subscribed clients
+    // Read from stdin to update the characteristic manually.
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         match line {
             Ok(input) => {
                 let trimmed_input = input.trim().to_lowercase();
-    
-                // Check if the input is "on" or "off" and update the STATE variable
                 match trimmed_input.as_str() {
                     "on" => {
                         STATE.store(true, Ordering::SeqCst);
@@ -109,15 +128,14 @@ async fn start_app() {
                         println!("STATE changed to: OFF ❌");
                     }
                     _ => {
-                        println!("Writing: {input} to {char_uuid}");
+                        println!("Writing: {} to {:?}", input, char_uuid);
                     }
                 }
-    
-                // Update characteristic value to notify subscribers
-                peripheral
-                    .update_characteristic(char_uuid, input.into())
-                    .await
-                    .unwrap();
+                // Update the characteristic to notify subscribed clients.
+                let mut periph = peripheral.lock().await;
+                if let Err(e) = periph.update_characteristic(char_uuid, input.into()).await {
+                    log::error!("Error updating characteristic: {:?}", e);
+                }
             }
             Err(err) => {
                 log::error!("Error reading from console: {}", err);
@@ -127,16 +145,21 @@ async fn start_app() {
     }
 }
 
-pub fn handle_updates(update: PeripheralEvent) {
-    match update {
+async fn handle_updates(
+    event: PeripheralEvent,
+    peripheral: Arc<Mutex<Peripheral>>,
+    char_uuid: Uuid,
+) {
+    match event {
         PeripheralEvent::StateUpdate { is_powered } => {
-            log::info!("PowerOn: {is_powered:?}");
+            log::info!("PowerOn: {:?}", is_powered);
         }
-        PeripheralEvent::CharacteristicSubscriptionUpdate {
-            request,
-            subscribed,
-        } => {
-            log::info!("CharacteristicSubscriptionUpdate: Subscribed {subscribed} {request:?}");
+        PeripheralEvent::CharacteristicSubscriptionUpdate { request, subscribed } => {
+            log::info!(
+                "CharacteristicSubscriptionUpdate: Subscribed {} {:?}",
+                subscribed,
+                request
+            );
         }
         PeripheralEvent::ReadRequest {
             request,
@@ -147,15 +170,18 @@ pub fn handle_updates(update: PeripheralEvent) {
             let response_value = if current_state { "on" } else { "off" };
 
             log::info!(
-                "ReadRequest: {request:?} Offset: {offset} -> Responding: {response_value}"
+                "ReadRequest: {:?} Offset: {} -> Responding: {}",
+                request,
+                offset,
+                response_value
             );
 
-            responder
-                .send(ReadRequestResponse {
-                    value: response_value.into(),
-                    response: RequestResponse::Success,
-                })
-                .unwrap();
+            if let Err(e) = responder.send(ReadRequestResponse {
+                value: response_value.into(),
+                response: RequestResponse::Success,
+            }) {
+                log::error!("Failed to send read response: {:?}", e);
+            }
         }
         PeripheralEvent::WriteRequest {
             request,
@@ -164,32 +190,46 @@ pub fn handle_updates(update: PeripheralEvent) {
             responder,
         } => {
             if let Ok(msg) = String::from_utf8(value.clone()) {
-                log::info!("WriteRequest: Received message -> {msg}");
+                log::info!("WriteRequest: Received message -> {}", msg);
 
-                // Check if received value is "on" or "off"
-                match msg.trim() {
+                let new_value = match msg.trim() {
                     "on" => {
                         STATE.store(true, Ordering::SeqCst);
                         log::info!("STATE changed to: ON ✅");
+                        "on"
                     }
                     "off" => {
                         STATE.store(false, Ordering::SeqCst);
                         log::info!("STATE changed to: OFF ❌");
+                        "off"
                     }
                     _ => {
-                        log::warn!("WriteRequest: Unrecognized value -> {msg}");
+                        log::warn!("WriteRequest: Unrecognized value -> {}", msg);
+                        msg.as_str()
                     }
+                };
+
+                // Update the characteristic to notify subscribed clients.
+                if let Err(e) = peripheral
+                    .lock()
+                    .await
+                    .update_characteristic(char_uuid, new_value.into())
+                    .await
+                {
+                    log::error!("Error updating characteristic in WriteRequest: {:?}", e);
                 }
-                
             } else {
                 log::error!("WriteRequest: Received non-UTF8 data");
             }
 
-            responder
-                .send(WriteRequestResponse {
-                    response: RequestResponse::Success,                    
-                })
-                .unwrap();
+            if let Err(e) = responder.send(WriteRequestResponse {
+                response: RequestResponse::Success,
+            }) {
+                log::error!("Failed to send write response: {:?}", e);
+            }
+        }
+        _ => {
+            log::info!("Unhandled event: {:?}", event);
         }
     }
 }
