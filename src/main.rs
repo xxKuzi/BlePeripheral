@@ -96,7 +96,24 @@ async fn start_app() {
     for line in stdin.lock().lines() {
         match line {
             Ok(input) => {
-                println!("Writing: {input} to {char_uuid}");
+                let trimmed_input = input.trim().to_lowercase();
+    
+                // Check if the input is "on" or "off" and update the STATE variable
+                match trimmed_input.as_str() {
+                    "on" => {
+                        STATE.store(true, Ordering::SeqCst);
+                        println!("STATE changed to: ON ✅");
+                    }
+                    "off" => {
+                        STATE.store(false, Ordering::SeqCst);
+                        println!("STATE changed to: OFF ❌");
+                    }
+                    _ => {
+                        println!("Writing: {input} to {char_uuid}");
+                    }
+                }
+    
+                // Update characteristic value to notify subscribers
                 peripheral
                     .update_characteristic(char_uuid, input.into())
                     .await
@@ -163,13 +180,14 @@ pub fn handle_updates(update: PeripheralEvent) {
                         log::warn!("WriteRequest: Unrecognized value -> {msg}");
                     }
                 }
+                
             } else {
                 log::error!("WriteRequest: Received non-UTF8 data");
             }
 
             responder
                 .send(WriteRequestResponse {
-                    response: RequestResponse::Success,
+                    response: RequestResponse::Success,                    
                 })
                 .unwrap();
         }
