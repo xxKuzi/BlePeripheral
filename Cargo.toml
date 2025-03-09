@@ -1,0 +1,12 @@
+[package]
+name = "bluetooth"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+ble-peripheral-rust = { git = "https://github.com/rohitsangwan01/ble-peripheral-rust" }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+pretty_env_logger = "0.5"
+uuid = { version = "1", features = ["v4"] }
